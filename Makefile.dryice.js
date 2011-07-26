@@ -37,6 +37,120 @@
 var path = require('path');
 var fs = require('fs');
 var copy = require('dryice').copy;
+var ujs = require('uglify-js');
+
+function myFilter (input, sourceInfo) {
+  if (!sourceInfo) {
+    throw new Error('Need source info');
+  }
+
+  input = input.toString();
+
+  var module = sourceInfo.module;
+  if (!module){
+    if (sourceInfo.base) {
+      module = sourceInfo.path.replace(/\.js$/, '');
+    } else {
+      // This is not a commonjs module.
+      return input;
+    }
+  }
+
+  var w = ujs.uglify.ast_walker();
+  var walk = w.walk;
+  var ast = ujs.parser.parse(input);
+  var dep;
+
+  var walkers = {
+    call: function (expr, args) {
+      if (expr[0] === 'name' && expr[1] === 'define') {
+        if (!(args.length === 1
+              && args[0][0] === 'function'
+              && args[0][2].length === 3
+              && args[0][2][0] === 'require'
+              && args[0][2][1] === 'exports'
+              && args[0][2][2] === 'module')) {
+          throw new TypeError('Only support define(function (require, exports, module) {...});');
+        }
+        return ['assign', true,
+                ['dot', ['sub', ['name', '__MODULES'], ['string', module]], 'exports'],
+                 ['binary', '||',
+                  ['call', walk(args[0]),
+                   [['name', 'null'],
+                    ['dot',
+                     ['sub', ['name', '__MODULES'], ['string', module]],
+                     'exports'],
+                    ['sub', ['name', '__MODULES'], ['string', module]]]],
+                  ['dot', ['sub', ['name', '__MODULES'], ['string', module]], 'exports']]];
+      } else if (expr[0] === 'name' && expr[1] === 'require') {
+        if (args[0] && args[0][0] === "string") {
+          dep = args[0][1];
+          return ['dot', ['sub', ['name', '__MODULES'], ['string', dep]], 'exports'];
+        } else {
+          throw new TypeError('Can only require string literals');
+        }
+      } else {
+        return ['call', expr, args];
+      }
+    }
+  };
+
+  var moduleDefinition = ujs.uglify.gen_code(w.with_walkers(walkers, walk.bind(w, ast)), {
+    beautify: true,
+    indent_level: 2
+  });
+
+  return '__MODULES["' + module + '"] = { exports: {} };\n' + moduleDefinition + '\n\n';
+}
+
+myFilter.onRead = true;
+
+var topologicalSort = (function () {
+
+  function sourcesDependingOn(target, sources) {
+    var results = [];
+    for (var i = 0; i < sources.length; i++) {
+      if (sources[i].deps) {
+        if (Object.keys(sources[i].deps).indexOf(target.module) >= 0) {
+          results.push(sources[i]);
+        }
+      }
+    }
+    return results;
+  }
+
+  function hasNoDeps(s) {
+    return !s.deps || Object.keys(s.deps).length === 0;
+  }
+
+  return function (sources) {
+    var sorted = [];
+    var sourcesWithNoDeps = sources.filter(hasNoDeps);
+
+    var n;
+    while ( sourcesWithNoDeps.length > 0 ) {
+      n = sourcesWithNoDeps.pop();
+      sorted.push(n);
+      sourcesDependingOn(n, sources).forEach(function (m) {
+        if (!delete m.deps[n.module]) {
+          throw new TypeError('Cannot remove dependency');
+        }
+        if (hasNoDeps(m)) {
+          sourcesWithNoDeps.push(m);
+        }
+      });
+    }
+
+    if (sources.filter(hasNoDeps).length !== sources.length) {
+      throw new Error("There is at least one type of circular dependency. Can't build.");
+    }
+
+    return sorted;
+  };
+
+}());
+
+
 
 function buildBrowser() {
   console.log('Creating dist/source-map.js');
@@ -47,13 +161,14 @@ function buildBrowser() {
 
   copy({
     source: [
-      'build/mini-require.js',
-      copy.source.commonjs({
+      'build/prefix-source-map.js',
+      topologicalSort(copy.source.commonjs({
         project: project,
         require: [ 'source-map' ]
-      })
+      })()),
+      'build/suffix-source-map.js'
     ],
-    filter: copy.filter.moduleDefines,
+    filter: myFilter,
     dest: 'dist/source-map.js'
   });
 }
@@ -69,7 +184,7 @@ function buildBrowserMin() {
 }
 
 function buildFirefox() {
-  console.log('Creating dist/source-map-consumer.jsm');
+  console.log('Creating dist/SourceMapConsumer.jsm');
 
   var project = copy.createCommonJsProject({
     roots: [ path.join(__dirname, 'lib') ]
@@ -78,13 +193,13 @@ function buildFirefox() {
   copy({
     source: [
       'build/prefix-source-map-consumer.jsm',
-      copy.source.commonjs({
+      topologicalSort(copy.source.commonjs({
         project: project,
         require: [ 'source-map/source-map-consumer' ]
-      }),
+      })()),
       'build/suffix-source-map-consumer.jsm'
     ],
-    filter: copy.filter.moduleDefines,
+    filter: myFilter,
     dest: 'dist/SourceMapConsumer.jsm'
   });
 }
